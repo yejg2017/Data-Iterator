@@ -121,6 +121,31 @@ def compute_edges(image):
     edged = cv2.bitwise_or(sobel_x, sobel_y)
     return edged
 
+"""
+def to_brighten(image,ratio=0.2):
+    w,h=image.shape[1],image.shape[0]
+    #to_time=1.+ratio
+    for xi in range(0,w):
+        for xj in range(0,h):
+            ##set the pixel value increase to 1020% 
+            image[xj,xi,0] = int(image[xj,xi,0]*ratio)
+            image[xj,xi,1] = int(image[xj,xi,1]*ratio)
+            image[xj,xi,2] = int(image[xj,xi,2]*ratio)
+    return image
+    # too slow
+"""
+def to_brighten(img):
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3., tileGridSize=(8,8))
+
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)  # convert from BGR to LAB color space
+    l, a, b = cv2.split(lab)  # split on 3 different channels
+
+    l2 = clahe.apply(l)  # apply CLAHE to the L-channel
+
+    lab = cv2.merge((l2,a,b))  # merge channels
+    img2 = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)  # convert from LAB to BGR
+    return img2
 
 def crop_image_to_edge(image, threshold=10, margin=0.2):
     edged = compute_edges(image)
@@ -213,16 +238,61 @@ def image_pre_train(path,image_size,method='hsv'):
            r,g,b=cv2.split(image_rgb)
            mean_rgbs.append(np.array([np.mean(r),np.mean(g),np.mean(b)]))
        return np.mean(mean_rgbs,axis=0)
+def extract_bv(image):
+    b,green_fundus,r = cv2.split(image)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    contrast_enhanced_green_fundus = clahe.apply(green_fundus)
 
+   # applying alternate sequential filtering (3 times closing opening)
+    r1 = cv2.morphologyEx(contrast_enhanced_green_fundus, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)), iterations = 1)
+    R1 = cv2.morphologyEx(r1, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)), iterations = 1)
+    r2 = cv2.morphologyEx(R1, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(11,11)), iterations = 1)
+    R2 = cv2.morphologyEx(r2, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(11,11)), iterations = 1)
+    r3 = cv2.morphologyEx(R2, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(23,23)), iterations = 1)
+    R3 = cv2.morphologyEx(r3, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(23,23)), iterations = 1)
+    f4 = cv2.subtract(R3,contrast_enhanced_green_fundus)
+    f5 = clahe.apply(f4)
+
+   # removing very small contours through area parameter noise removal
+    ret,f6 = cv2.threshold(f5,15,255,cv2.THRESH_BINARY)	
+    mask = np.ones(f5.shape[:2], dtype="uint8") * 255	
+    im2, contours, hierarchy = cv2.findContours(f6.copy(),cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        if cv2.contourArea(cnt) <= 200:
+            cv2.drawContours(mask, [cnt], -1, 0, -1)
+    im = cv2.bitwise_and(f5, f5, mask=mask)
+    ret,fin = cv2.threshold(im,15,255,cv2.THRESH_BINARY_INV)
+    newfin = cv2.erode(fin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
+
+    # removing blobs of unwanted bigger chunks taking in consideration they are not straight lines like blood
+    #vessels and also in an interval of area
+    fundus_eroded = cv2.bitwise_not(newfin)	
+    xmask = np.ones(fundus_eroded.shape[:2], dtype="uint8") * 255
+    x1, xcontours, xhierarchy = cv2.findContours(fundus_eroded.copy(),cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in xcontours:
+        shape = "unidentified"
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, False)
+    if len(approx) > 4 and cv2.contourArea(cnt) <= 3000 and cv2.contourArea(cnt) >= 100:
+        hape = "circle"	
+    else:
+        shape = "veins"
+    if(shape=="circle"):
+       cv2.drawContours(xmask, [cnt], -1, 0, -1)
+
+    finimage = cv2.bitwise_and(fundus_eroded,fundus_eroded,mask=xmask)
+    blood_vessels = cv2.bitwise_not(finimage)
+    return blood_vessels
 
 class BatchIter(object):
-    def __init__(self,image_list,batch_size,image_size=224,shuffle=True,
+    def __init__(self,image_list,batch_size,image_size=224,shuffle=True,method='vessel',
                 features=None,ishandle=False):
         self.image_list=image_list
         self.batch_size=batch_size
         self.shuffle=shuffle
         self.image_size=image_size
         self.pointer=0
+        self.method=method
         self.features=features
         self.ishandle=ishandle
         self.shuffle_data()
@@ -246,6 +316,7 @@ class BatchIter(object):
             
     def load_images(self,file):
         image=load_images(file=file,image_size=self.image_size)
+        image=to_brighten(image)
         return image
     
     def handle(self,image):
@@ -255,23 +326,31 @@ class BatchIter(object):
             hsv=95
             rgb=[94.93608747,65.04593331,43.7864766]
         
-        if np.random.random() < 0.5:
-            img=cv2.flip(image,1)
+        if self.method=='vessel':
+            img=to_brighten(image)
+            img=extract_bv(img)
+            img=img[:,:,np.newaxis]
+        elif self.method=='enforce':
+            if np.random.random() < 0.5:
+               img=to_brighten(image)
+               img=cv2.flip(img,1)
         
+            else:
+               img=to_brighten(image)
+               # 定义卷积核 5x5
+            kernel = np.ones((5,5), np.float32)/25
+            img= cv2.filter2D(img,-1,kernel)
+        
+            img=cv2.GaussianBlur(img,(5,5),0)
+            img=crop_image_to_edge(image=image)
+            img=crop_image_to_aspect(image=img)
+            img=brighten_image_hsv(image=img,global_mean_v=hsv)
+            img=brighten_image_rgb(image=img,global_mean_rgb=rgb)
+            img=(img+255)/255
+            img=cv2.resize(img,(self.image_size,self.image_size))
         else:
-            img=image
-        # 定义卷积核 5x5
-        kernel = np.ones((5,5), np.float32)/25
-        img= cv2.filter2D(img,-1,kernel)
-        
-        img=cv2.GaussianBlur(img,(5,5),0)
-        img=crop_image_to_edge(image=image)
-        img=crop_image_to_aspect(image=img)
-        img=brighten_image_hsv(image=img,global_mean_v=hsv)
-        img=brighten_image_rgb(image=img,global_mean_rgb=rgb)
-        img=(img+255)/255
-        img=cv2.resize(img,(self.image_size,self.image_size))
-            
+            #print('Invalid image handle method,and do nothing!!!')
+            img=to_brighten(image)
         return img
                         
     def next(self):
